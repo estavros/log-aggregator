@@ -64,6 +64,18 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleList(w http.ResponseWriter, r *http.Request) {
+	serviceFilter := r.URL.Query().Get("service")
+	levelFilter := r.URL.Query().Get("level")
+	sinceStr := r.URL.Query().Get("since")
+
+	var since time.Time
+	if sinceStr != "" {
+		t, err := time.Parse(time.RFC3339, sinceStr)
+		if err == nil {
+			since = t
+		}
+	}
+
 	fileMutex.Lock()
 	defer fileMutex.Unlock()
 
@@ -76,9 +88,23 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 	var logs []LogEntry
 	scanner := bufio.NewScanner(f)
+
 	for scanner.Scan() {
 		var e LogEntry
-		json.Unmarshal(scanner.Bytes(), &e)
+		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
+			continue
+		}
+
+		if serviceFilter != "" && e.Service != serviceFilter {
+			continue
+		}
+		if levelFilter != "" && e.Level != levelFilter {
+			continue
+		}
+		if !since.IsZero() && e.Timestamp.Before(since) {
+			continue
+		}
+
 		logs = append(logs, e)
 	}
 
@@ -106,8 +132,20 @@ func sendLog(service, level, msg string) {
 	fmt.Println("Log sent:", resp.Status)
 }
 
-func listLogs() {
-	resp, err := http.Get("http://localhost:8080/logs")
+func listLogs(service, level, since string) {
+	url := "http://localhost:8080/logs?"
+
+	if service != "" {
+		url += "service=" + service + "&"
+	}
+	if level != "" {
+		url += "level=" + level + "&"
+	}
+	if since != "" {
+		url += "since=" + since + "&"
+	}
+
+	resp, err := http.Get(url)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
@@ -154,7 +192,13 @@ func main() {
 		sendLog(*service, *level, *msg)
 
 	case "list":
-		listLogs()
+		listCmd := flag.NewFlagSet("list", flag.ExitOnError)
+		service := listCmd.String("service", "", "filter by service")
+		level := listCmd.String("level", "", "filter by level")
+		since := listCmd.String("since", "", "RFC3339 timestamp")
+		listCmd.Parse(os.Args[2:])
+
+		listLogs(*service, *level, *since)
 
 	default:
 		fmt.Println("Unknown command")
