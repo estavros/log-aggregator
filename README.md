@@ -1,4 +1,4 @@
-# Log Aggregator (Go)
+# Log Aggregator
 
 A minimal log aggregation system written in Go.  
 It provides an HTTP server for collecting structured logs and a CLI tool for sending and querying them.
