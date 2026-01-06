@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
 const logFile = "logs.jsonl"
+const alertFile = "alerts.log"
 
 type LogEntry struct {
 	Service   string    `json:"service"`
@@ -21,13 +23,46 @@ type LogEntry struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-var fileMutex sync.Mutex
+type AlertRule struct {
+	Service   string        `json:"service"`
+	Level     string        `json:"level"`
+	Contains  string        `json:"contains"`
+	Threshold int           `json:"threshold"`
+	Window    time.Duration `json:"window"`
+}
+
+var (
+	fileMutex     sync.Mutex
+	alertMutex    sync.Mutex
+	alertCounters = map[string][]time.Time{}
+)
+
+// ---------------- ALERT RULES ----------------
+
+// You can change or add more
+var alertRules = []AlertRule{
+	{
+		Service:   "payments",
+		Level:     "error",
+		Contains:  "",
+		Threshold: 3,
+		Window:    60 * time.Second,
+	},
+	{
+		Service:   "",
+		Level:     "fatal",
+		Contains:  "",
+		Threshold: 1,
+		Window:    10 * time.Second,
+	},
+}
 
 // ---------------- SERVER ----------------
 
 func runServer() {
 	http.HandleFunc("/log", handleLog)
 	http.HandleFunc("/logs", handleList)
+	http.HandleFunc("/alerts", handleAlerts)
 
 	fmt.Println("Log server running on http://localhost:8080")
 	http.ListenAndServe(":8080", nil)
@@ -46,6 +81,8 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry.Timestamp = time.Now().UTC()
+
+	processAlerts(entry)
 
 	data, _ := json.Marshal(entry)
 
@@ -109,6 +146,67 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(logs)
+}
+
+func handleAlerts(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(alertRules)
+}
+
+// ---------------- ALERT ENGINE ----------------
+
+func processAlerts(entry LogEntry) {
+	alertMutex.Lock()
+	defer alertMutex.Unlock()
+
+	now := time.Now()
+
+	for _, rule := range alertRules {
+		if rule.Service != "" && entry.Service != rule.Service {
+			continue
+		}
+		if rule.Level != "" && entry.Level != rule.Level {
+			continue
+		}
+		if rule.Contains != "" && !strings.Contains(entry.Message, rule.Contains) {
+			continue
+		}
+
+		key := rule.Service + "|" + rule.Level + "|" + rule.Contains
+
+		alertCounters[key] = append(alertCounters[key], now)
+
+		// Remove old timestamps
+		cutoff := now.Add(-rule.Window)
+		var recent []time.Time
+		for _, t := range alertCounters[key] {
+			if t.After(cutoff) {
+				recent = append(recent, t)
+			}
+		}
+		alertCounters[key] = recent
+
+		if len(recent) >= rule.Threshold {
+			triggerAlert(rule, entry, len(recent))
+			alertCounters[key] = []time.Time{} // reset after firing
+		}
+	}
+}
+
+func triggerAlert(rule AlertRule, entry LogEntry, count int) {
+	msg := fmt.Sprintf(
+		"%s ALERT: %d %s logs from service=%s in %s\n",
+		time.Now().Format(time.RFC3339),
+		count,
+		rule.Level,
+		rule.Service,
+		rule.Window,
+	)
+
+	fmt.Print("🚨 ", msg)
+
+	f, _ := os.OpenFile(alertFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	defer f.Close()
+	f.WriteString(msg)
 }
 
 // ---------------- CLI ----------------
