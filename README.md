@@ -118,6 +118,24 @@ Example response:
 
 ---
 
+## Alerts
+
+The server can automatically monitor logs and trigger alerts based on configurable rules.
+
+### Default Rules
+- 3 or more `error` logs from the `payments` service within 1 minute trigger an alert.
+- Any `fatal` log triggers an immediate alert.
+
+### How Alerts Work
+- Alerts are printed to the console.
+- Alerts are written to `alerts.log`.
+- Rules are evaluated in real-time as logs are ingested.
+
+### View Active Rules
+You can see the configured alert rules via the API:
+
+---
+
 ## Data Format
 
 Logs are stored in logs.jsonl using the JSON Lines format (one JSON object per line):
