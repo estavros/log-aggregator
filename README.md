@@ -15,6 +15,9 @@ Logs are stored in an append-only JSON file and can be filtered by service, leve
 - CLI for sending and listing logs  
 - Concurrent-safe writes  
 - Filtering by service, level, and timestamp  
+- Rule-based alerting engine  
+- Real-time log streaming via WebSockets  
+- Real-time alert push via WebSockets  
 
 ---
 
