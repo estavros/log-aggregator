@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const logFile = "logs.jsonl"
@@ -35,26 +37,19 @@ var (
 	fileMutex     sync.Mutex
 	alertMutex    sync.Mutex
 	alertCounters = map[string][]time.Time{}
+
+	wsLogClients   = map[*websocket.Conn]bool{}
+	wsAlertClients = map[*websocket.Conn]bool{}
+	wsMutex        sync.Mutex
 )
+
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 // ---------------- ALERT RULES ----------------
 
-// You can change or add more
 var alertRules = []AlertRule{
-	{
-		Service:   "payments",
-		Level:     "error",
-		Contains:  "",
-		Threshold: 3,
-		Window:    60 * time.Second,
-	},
-	{
-		Service:   "",
-		Level:     "fatal",
-		Contains:  "",
-		Threshold: 1,
-		Window:    10 * time.Second,
-	},
+	{Service: "payments", Level: "error", Threshold: 3, Window: 60 * time.Second},
+	{Level: "fatal", Threshold: 1, Window: 10 * time.Second},
 }
 
 // ---------------- SERVER ----------------
@@ -64,9 +59,46 @@ func runServer() {
 	http.HandleFunc("/logs", handleList)
 	http.HandleFunc("/alerts", handleAlerts)
 
+	http.HandleFunc("/ws/logs", wsLogs)
+	http.HandleFunc("/ws/alerts", wsAlerts)
+
 	fmt.Println("Log server running on http://localhost:8080")
 	http.ListenAndServe(":8080", nil)
 }
+
+// ---------------- WebSockets ----------------
+
+func wsLogs(w http.ResponseWriter, r *http.Request) {
+	c, _ := upgrader.Upgrade(w, r, nil)
+	wsMutex.Lock()
+	wsLogClients[c] = true
+	wsMutex.Unlock()
+}
+
+func wsAlerts(w http.ResponseWriter, r *http.Request) {
+	c, _ := upgrader.Upgrade(w, r, nil)
+	wsMutex.Lock()
+	wsAlertClients[c] = true
+	wsMutex.Unlock()
+}
+
+func broadcastLogs(e LogEntry) {
+	wsMutex.Lock()
+	defer wsMutex.Unlock()
+	for c := range wsLogClients {
+		c.WriteJSON(e)
+	}
+}
+
+func broadcastAlert(msg string) {
+	wsMutex.Lock()
+	defer wsMutex.Unlock()
+	for c := range wsAlertClients {
+		c.WriteMessage(websocket.TextMessage, []byte(msg))
+	}
+}
+
+// ---------------- HTTP ----------------
 
 func handleLog(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -76,51 +108,35 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 
 	var entry LogEntry
 	if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		http.Error(w, "Invalid JSON", 400)
 		return
 	}
 
 	entry.Timestamp = time.Now().UTC()
 
 	processAlerts(entry)
+	broadcastLogs(entry)
 
 	data, _ := json.Marshal(entry)
 
 	fileMutex.Lock()
 	defer fileMutex.Unlock()
 
-	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		http.Error(w, "Could not open log file", 500)
-		return
-	}
+	f, _ := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	defer f.Close()
-
 	f.WriteString(string(data) + "\n")
+
 	w.WriteHeader(http.StatusCreated)
 }
 
 func handleList(w http.ResponseWriter, r *http.Request) {
-	serviceFilter := r.URL.Query().Get("service")
-	levelFilter := r.URL.Query().Get("level")
-	sinceStr := r.URL.Query().Get("since")
-
-	var since time.Time
-	if sinceStr != "" {
-		t, err := time.Parse(time.RFC3339, sinceStr)
-		if err == nil {
-			since = t
-		}
-	}
+	service := r.URL.Query().Get("service")
+	level := r.URL.Query().Get("level")
 
 	fileMutex.Lock()
 	defer fileMutex.Unlock()
 
-	f, err := os.Open(logFile)
-	if err != nil {
-		w.Write([]byte("[]"))
-		return
-	}
+	f, _ := os.Open(logFile)
 	defer f.Close()
 
 	var logs []LogEntry
@@ -128,20 +144,14 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 	for scanner.Scan() {
 		var e LogEntry
-		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
-			continue
-		}
+		json.Unmarshal(scanner.Bytes(), &e)
 
-		if serviceFilter != "" && e.Service != serviceFilter {
+		if service != "" && e.Service != service {
 			continue
 		}
-		if levelFilter != "" && e.Level != levelFilter {
+		if level != "" && e.Level != level {
 			continue
 		}
-		if !since.IsZero() && e.Timestamp.Before(since) {
-			continue
-		}
-
 		logs = append(logs, e)
 	}
 
@@ -167,15 +177,10 @@ func processAlerts(entry LogEntry) {
 		if rule.Level != "" && entry.Level != rule.Level {
 			continue
 		}
-		if rule.Contains != "" && !strings.Contains(entry.Message, rule.Contains) {
-			continue
-		}
 
-		key := rule.Service + "|" + rule.Level + "|" + rule.Contains
-
+		key := rule.Service + rule.Level
 		alertCounters[key] = append(alertCounters[key], now)
 
-		// Remove old timestamps
 		cutoff := now.Add(-rule.Window)
 		var recent []time.Time
 		for _, t := range alertCounters[key] {
@@ -186,80 +191,43 @@ func processAlerts(entry LogEntry) {
 		alertCounters[key] = recent
 
 		if len(recent) >= rule.Threshold {
-			triggerAlert(rule, entry, len(recent))
-			alertCounters[key] = []time.Time{} // reset after firing
+			msg := fmt.Sprintf("🚨 %s %d %s logs from %s\n",
+				time.Now().Format(time.RFC3339),
+				len(recent),
+				rule.Level,
+				rule.Service,
+			)
+
+			fmt.Print(msg)
+			broadcastAlert(msg)
+
+			f, _ := os.OpenFile(alertFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+			f.WriteString(msg)
+			f.Close()
+
+			alertCounters[key] = []time.Time{}
 		}
 	}
-}
-
-func triggerAlert(rule AlertRule, entry LogEntry, count int) {
-	msg := fmt.Sprintf(
-		"%s ALERT: %d %s logs from service=%s in %s\n",
-		time.Now().Format(time.RFC3339),
-		count,
-		rule.Level,
-		rule.Service,
-		rule.Window,
-	)
-
-	fmt.Print("🚨 ", msg)
-
-	f, _ := os.OpenFile(alertFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	defer f.Close()
-	f.WriteString(msg)
 }
 
 // ---------------- CLI ----------------
 
 func sendLog(service, level, msg string) {
-	entry := LogEntry{
-		Service: service,
-		Level:   level,
-		Message: msg,
-	}
-
+	entry := LogEntry{Service: service, Level: level, Message: msg}
 	data, _ := json.Marshal(entry)
-
-	resp, err := http.Post("http://localhost:8080/log", "application/json", bytes.NewBuffer(data))
-	if err != nil {
-		fmt.Println("Error:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	fmt.Println("Log sent:", resp.Status)
+	http.Post("http://localhost:8080/log", "application/json", bytes.NewBuffer(data))
+	fmt.Println("Sent")
 }
 
-func listLogs(service, level, since string) {
-	url := "http://localhost:8080/logs?"
-
-	if service != "" {
-		url += "service=" + service + "&"
-	}
-	if level != "" {
-		url += "level=" + level + "&"
-	}
-	if since != "" {
-		url += "since=" + since + "&"
-	}
-
-	resp, err := http.Get(url)
-	if err != nil {
-		fmt.Println("Error:", err)
-		return
-	}
+func listLogs(service, level string) {
+	url := "http://localhost:8080/logs?service=" + service + "&level=" + level
+	resp, _ := http.Get(url)
 	defer resp.Body.Close()
 
 	var logs []LogEntry
 	json.NewDecoder(resp.Body).Decode(&logs)
-
 	for _, l := range logs {
-		fmt.Printf("[%s] %-8s %-10s %s\n",
-			l.Timestamp.Format(time.RFC3339),
-			l.Level,
-			l.Service,
-			l.Message,
-		)
+		fmt.Println(l.Timestamp, l.Level, l.Service, l.Message)
 	}
 }
 
@@ -267,38 +235,25 @@ func listLogs(service, level, since string) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: server | send | list")
+		fmt.Println("server | send | list")
 		return
 	}
 
 	switch os.Args[1] {
 	case "server":
 		runServer()
-
 	case "send":
 		sendCmd := flag.NewFlagSet("send", flag.ExitOnError)
-		service := sendCmd.String("service", "", "service name")
-		level := sendCmd.String("level", "", "log level")
-		msg := sendCmd.String("msg", "", "message")
+		s := sendCmd.String("service", "", "")
+		l := sendCmd.String("level", "", "")
+		m := sendCmd.String("msg", "", "")
 		sendCmd.Parse(os.Args[2:])
-
-		if *service == "" || *level == "" || *msg == "" {
-			fmt.Println("Missing flags")
-			return
-		}
-
-		sendLog(*service, *level, *msg)
-
+		sendLog(*s, *l, *m)
 	case "list":
 		listCmd := flag.NewFlagSet("list", flag.ExitOnError)
-		service := listCmd.String("service", "", "filter by service")
-		level := listCmd.String("level", "", "filter by level")
-		since := listCmd.String("since", "", "RFC3339 timestamp")
+		s := listCmd.String("service", "", "")
+		l := listCmd.String("level", "", "")
 		listCmd.Parse(os.Args[2:])
-
-		listLogs(*service, *level, *since)
-
-	default:
-		fmt.Println("Unknown command")
+		listLogs(*s, *l)
 	}
 }
