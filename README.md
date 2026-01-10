@@ -21,6 +21,25 @@ Logs are stored in an append-only JSON file and can be filtered by service, leve
 
 ---
 
+## Architecture Overview
+
+This system consists of three main components:
+
+1. **Log Ingestion API**
+   Services send JSON logs to `POST /log`.
+
+2. **Storage Engine**
+   Logs are written to an append-only JSON Lines file (`logs.jsonl`) for durability and easy streaming.
+
+3. **Query + Streaming Layer**
+   - `GET /logs` allows querying historical logs
+   - WebSocket endpoints stream new logs and alerts in real time
+
+4. **Alert Engine**
+   Incoming logs are evaluated against rule-based alert policies and trigger alerts when thresholds are exceeded.
+
+---
+
 ## Getting Started
 
 ### 1. Start the server
@@ -64,6 +83,26 @@ go run main.go list --since 2026-01-03T18:01:00Z
 go run main.go list --service auth --level error --since 2026-01-03T18:01:00Z  
 
 The --since flag uses RFC3339 timestamps.
+
+---
+
+## Real-Time Streaming
+
+The server exposes WebSocket endpoints for real-time updates.
+
+### Stream live logs
+Connect to:
+
+ws://localhost:8080/ws/logs
+
+Every new log entry will be sent to connected clients as JSON.
+
+### Stream live alerts
+Connect to:
+
+ws://localhost:8080/ws/alerts
+
+Whenever an alert fires, a text message is pushed to all connected clients.
 
 ---
 
@@ -151,6 +190,20 @@ This format is:
 - Crash-safe  
 - Easy to parse and stream  
 - Efficient for filtering and indexing  
+
+---
+
+## Design Notes & Limitations
+
+This project is intentionally simple and uses a file-based storage model.
+
+Tradeoffs:
+- Logs are stored on disk instead of a database
+- Queries scan the file linearly
+- No log rotation or retention yet
+- No authentication on the API
+
+These choices keep the system easy to understand, reliable, and portable while still demonstrating real production concepts.
 
 ---
 
