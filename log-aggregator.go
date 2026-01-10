@@ -31,12 +31,15 @@ type AlertRule struct {
 	Contains  string        `json:"contains"`
 	Threshold int           `json:"threshold"`
 	Window    time.Duration `json:"window"`
+	Cooldown  time.Duration `json:"cooldown"`
 }
 
 var (
-	fileMutex     sync.Mutex
-	alertMutex    sync.Mutex
-	alertCounters = map[string][]time.Time{}
+	fileMutex  sync.Mutex
+	alertMutex sync.Mutex
+
+	alertCounters = map[string]map[string][]time.Time{} // ruleKey -> message -> times
+	lastAlert     = map[string]time.Time{}
 
 	wsLogClients   = map[*websocket.Conn]bool{}
 	wsAlertClients = map[*websocket.Conn]bool{}
@@ -45,11 +48,9 @@ var (
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
-// ---------------- ALERT RULES ----------------
-
 var alertRules = []AlertRule{
-	{Service: "payments", Level: "error", Threshold: 3, Window: 60 * time.Second},
-	{Level: "fatal", Threshold: 1, Window: 10 * time.Second},
+	{Service: "payments", Level: "error", Threshold: 3, Window: 60 * time.Second, Cooldown: 2 * time.Minute},
+	{Level: "fatal", Threshold: 1, Window: 10 * time.Second, Cooldown: 5 * time.Minute},
 }
 
 // ---------------- SERVER ----------------
@@ -58,7 +59,6 @@ func runServer() {
 	http.HandleFunc("/log", handleLog)
 	http.HandleFunc("/logs", handleList)
 	http.HandleFunc("/alerts", handleAlerts)
-
 	http.HandleFunc("/ws/logs", wsLogs)
 	http.HandleFunc("/ws/alerts", wsAlerts)
 
@@ -177,25 +177,39 @@ func processAlerts(entry LogEntry) {
 		if rule.Level != "" && entry.Level != rule.Level {
 			continue
 		}
+		if rule.Contains != "" && !strings.Contains(entry.Message, rule.Contains) {
+			continue
+		}
 
-		key := rule.Service + rule.Level
-		alertCounters[key] = append(alertCounters[key], now)
+		ruleKey := rule.Service + "|" + rule.Level + "|" + rule.Contains
+
+		if alertCounters[ruleKey] == nil {
+			alertCounters[ruleKey] = map[string][]time.Time{}
+		}
+
+		alertCounters[ruleKey][entry.Message] = append(alertCounters[ruleKey][entry.Message], now)
 
 		cutoff := now.Add(-rule.Window)
 		var recent []time.Time
-		for _, t := range alertCounters[key] {
+		for _, t := range alertCounters[ruleKey][entry.Message] {
 			if t.After(cutoff) {
 				recent = append(recent, t)
 			}
 		}
-		alertCounters[key] = recent
+		alertCounters[ruleKey][entry.Message] = recent
 
 		if len(recent) >= rule.Threshold {
-			msg := fmt.Sprintf("🚨 %s %d %s logs from %s\n",
-				time.Now().Format(time.RFC3339),
-				len(recent),
-				rule.Level,
-				rule.Service,
+			if last, ok := lastAlert[ruleKey+entry.Message]; ok {
+				if now.Sub(last) < rule.Cooldown {
+					return
+				}
+			}
+
+			msg := fmt.Sprintf("🚨 %s | %s | %s | %s\n",
+				now.Format(time.RFC3339),
+				entry.Service,
+				entry.Level,
+				entry.Message,
 			)
 
 			fmt.Print(msg)
@@ -205,7 +219,8 @@ func processAlerts(entry LogEntry) {
 			f.WriteString(msg)
 			f.Close()
 
-			alertCounters[key] = []time.Time{}
+			lastAlert[ruleKey+entry.Message] = now
+			alertCounters[ruleKey][entry.Message] = []time.Time{}
 		}
 	}
 }
